@@ -1,8 +1,10 @@
 # CLI test driver for bend-data-duckdb.
 # Modes:
-#   f32  <db> <sql>   -> prints shape, column names, rows, and a second-pass sum (tests Data reuse)
-#   text <db> <sql>   -> prints shape, column names, and string rows
-#   exec <db> <sql>   -> executes DDL/DML and prints OK
+#   f32     <db> <sql> -> prints shape, column names, rows, and a second-pass sum (tests Data reuse)
+#   f32bits <db> <sql> -> prints exact IEEE-754 U32 bit patterns per cell
+#   text    <db> <sql> -> prints shape, column names, and string rows
+#   textlen <db> <sql> -> prints shape, column names, and character lengths per cell
+#   exec    <db> <sql> -> executes DDL/DML and prints OK
 import Base
 import ./duckdb.bend as D
 
@@ -41,6 +43,22 @@ def show_f32_rows(rs: List<&2, List<&2, F32>>) -> String:
     case Con{r, t}:
       show_f32_row(r) ++ "\n" ++ show_f32_rows(t)
 
+def show_f32_bits_row(xs: List<&2, F32>) -> String:
+  match xs:
+    case Nil{}:
+      ""
+    case Con{h, Nil{}}:
+      U32.show(F32.bits(h))
+    case Con{h, t}:
+      U32.show(F32.bits(h)) ++ " " ++ show_f32_bits_row(t)
+
+def show_f32_bits_rows(rs: List<&2, List<&2, F32>>) -> String:
+  match rs:
+    case Nil{}:
+      ""
+    case Con{r, t}:
+      show_f32_bits_row(r) ++ "\n" ++ show_f32_bits_rows(t)
+
 def sum_f32_row.add(is_nan: Bool, h: F32, acc: F32) -> F32:
   match is_nan:
     case True{}:
@@ -69,6 +87,22 @@ def show_text_rows(rs: List<&2, List<&2, String>>) -> String:
     case Con{r, t}:
       join_str("|", r) ++ "\n" ++ show_text_rows(t)
 
+def show_len_row(xs: List<&2, String>) -> String:
+  match xs:
+    case Nil{}:
+      ""
+    case Con{h, Nil{}}:
+      U32.show(U32.from_nat(String.length(h)))
+    case Con{h, t}:
+      U32.show(U32.from_nat(String.length(h))) ++ " " ++ show_len_row(t)
+
+def show_len_rows(rs: List<&2, List<&2, String>>) -> String:
+  match rs:
+    case Nil{}:
+      ""
+    case Con{r, t}:
+      show_len_row(r) ++ "\n" ++ show_len_rows(t)
+
 def sum_tbl(t: D.F32Table) -> F32:
   D.F32Table{_, _, _, rows} = t
   sum_f32_rows(rows, 0.0)
@@ -89,6 +123,15 @@ def render_f32(r: Result<&1, &1, U32 & String, D.F32Table>) -> String:
     case Done{tbl}:
       render_f32_tbl(tbl)
 
+def render_f32bits(r: Result<&1, &1, U32 & String, D.F32Table>) -> String:
+  match r:
+    case Fail{(code, msg)}:
+      "FAIL " ++ U32.show(code) ++ " " ++ msg ++ "\n"
+    case Done{D.F32Table{nr, nc, names, rows}}:
+      "F32BITS " ++ U32.show(nr) ++ " " ++ U32.show(nc) ++ "\n"
+        ++ "COLS " ++ join_str("|", names) ++ "\n"
+        ++ show_f32_bits_rows(rows)
+
 def render_text(r: Result<&1, &1, U32 & String, D.TextTable>) -> String:
   match r:
     case Fail{(code, msg)}:
@@ -98,6 +141,15 @@ def render_text(r: Result<&1, &1, U32 & String, D.TextTable>) -> String:
         ++ "COLS " ++ join_str("|", names) ++ "\n"
         ++ show_text_rows(rows)
 
+def render_textlen(r: Result<&1, &1, U32 & String, D.TextTable>) -> String:
+  match r:
+    case Fail{(code, msg)}:
+      "FAIL " ++ U32.show(code) ++ " " ++ msg ++ "\n"
+    case Done{D.TextTable{nr, nc, names, rows}}:
+      "TEXTLEN " ++ U32.show(nr) ++ " " ++ U32.show(nc) ++ "\n"
+        ++ "COLS " ++ join_str("|", names) ++ "\n"
+        ++ show_len_rows(rows)
+
 def render_exec(r: Result<&1, &1, U32 & String, Unit>) -> String:
   match r:
     case Fail{(code, msg)}:
@@ -105,25 +157,43 @@ def render_exec(r: Result<&1, &1, U32 & String, Unit>) -> String:
     case Done{Unit{}}:
       "OK\n"
 
-def dispatch.text(is_text: Bool, db: String, sql: String) -> IO(Unit):
+def dispatch.textlen(is_tl: Bool, db: String, sql: String) -> IO(Unit):
+  match is_tl:
+    case True{}:
+      do IO<Unit>:
+        r : Result<&1, &1, U32 & String, D.TextTable> <- D.query_text(db, sql)
+        IO.write(render_textlen(r))
+    case False{}:
+      do IO<Unit>:
+        r : Result<&1, &1, U32 & String, Unit> <- D.exec(db, sql)
+        IO.write(render_exec(r))
+
+def dispatch.text(is_text: Bool, mode: String, db: String, sql: String) -> IO(Unit):
   match is_text:
     case True{}:
       do IO<Unit>:
         r : Result<&1, &1, U32 & String, D.TextTable> <- D.query_text(db, sql)
         IO.write(render_text(r))
     case False{}:
-      do IO<Unit>:
-        r : Result<&1, &1, U32 & String, Unit> <- D.exec(db, sql)
-        IO.write(render_exec(r))
+      dispatch.textlen(String.eq(mode, "textlen"), db, sql)
 
-def dispatch.f32(is_f32: Bool, mode: String, db: String, sql: String) -> IO(Unit):
+def dispatch.bits(is_bits: Bool, +mode: String, db: String, sql: String) -> IO(Unit):
+  match is_bits:
+    case True{}:
+      do IO<Unit>:
+        r : Result<&1, &1, U32 & String, D.F32Table> <- D.query_f32(db, sql)
+        IO.write(render_f32bits(r))
+    case False{}:
+      dispatch.text(String.eq(mode, "text"), mode, db, sql)
+
+def dispatch.f32(is_f32: Bool, +mode: String, db: String, sql: String) -> IO(Unit):
   match is_f32:
     case True{}:
       do IO<Unit>:
         r : Result<&1, &1, U32 & String, D.F32Table> <- D.query_f32(db, sql)
         IO.write(render_f32(r))
     case False{}:
-      dispatch.text(String.eq(mode, "text"), db, sql)
+      dispatch.bits(String.eq(mode, "f32bits"), mode, db, sql)
 
 def dispatch(+mode: String, db: String, sql: String) -> IO(Unit):
   dispatch.f32(String.eq(mode, "f32"), mode, db, sql)
@@ -133,7 +203,7 @@ def run_args(args: List<String>) -> IO(Unit):
     case Con{_, Con{mode, Con{db, Con{sql, _}}}}:
       dispatch(mode, db, sql)
     case _:
-      IO.print("usage: check <f32|text|exec> <db_path> <sql>")
+      IO.print("usage: check <f32|f32bits|text|textlen|exec> <db_path> <sql>")
 
 def main() -> IO(Unit):
   do IO<Unit>:
