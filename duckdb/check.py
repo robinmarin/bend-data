@@ -2,6 +2,7 @@
 """Verification suite for bend-data-duckdb (C native + optional JS/Bun lane)."""
 import math
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -24,9 +25,12 @@ def build():
         sys.exit(1)
 
 
-def run_cli(mode, db, sql, js=False):
-    cmd = [BEND, "check.bend", mode, db, sql] if js else [BIN, mode, db, sql]
-    res = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+def run_cli(mode, db, sql, js=False, env_extra=None):
+    cmd = [BEND, "check.bend", "--", mode, db, sql] if js else [BIN, mode, db, sql]
+    env = os.environ.copy()
+    if env_extra:
+        env.update(env_extra)
+    res = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, env=env)
     if res.returncode != 0:
         raise RuntimeError(f"CLI failed ({res.returncode}): {res.stderr}\n{res.stdout}")
     return res.stdout.splitlines()
@@ -160,7 +164,7 @@ def run_suite(js=False):
         lines = run_cli("f32", ":memory:", "SELECT 1.0::DOUBLE AS a, NULL AS b", js=js)
         assert lines[0] == "F32 1 2" and lines[2].split()[1] == "NaN", lines
 
-        # 12. query_text rejects types duckdb_value_varchar can't format
+        # 12. query_text rejects types duckdb_value_string/varchar can't format
         #     (silent "" or, for UUID before another column, a libduckdb segfault)
         uuid = "'00000000-0000-0000-0000-000000000001'::UUID"
         for bad_sql in [
@@ -185,17 +189,90 @@ def run_suite(js=False):
         assert lines[0] == "TEXT 1 4", lines
         assert lines[2] == "[1, 2]|{'a': 1}|00000000-0000-0000-0000-000000000001|1", lines
 
-        # Supported scalar types still format
+        # Supported scalar types still format identically on C and JS (all DECIMAL widths + BLOB + negative values)
         lines = run_cli(
             "text",
             ":memory:",
-            "SELECT TRUE AS b, 170141183460469231731687303715884105727::HUGEINT AS h, "
-            "TIME '12:00' AS t, INTERVAL 1 DAY AS iv, 1.25::DECIMAL(5,2) AS d, 5::UHUGEINT AS uh",
+            "SELECT TRUE AS b, FALSE AS bf, -170141183460469231731687303715884105727::HUGEINT AS h, "
+            "TIME '12:00' AS t, INTERVAL 1 DAY AS iv, "
+            "-1.25::DECIMAL(4,2) AS d4, -12345.67::DECIMAL(9,2) AS d9, "
+            "-123456789012.34::DECIMAL(18,2) AS d18, -123456789012345678901.23::DECIMAL(38,2) AS d38, "
+            "5::UHUGEINT AS uh, '\\x00\\xAB'::BLOB AS bl, DATE '2025-01-01' AS dt, "
+            "TIMESTAMP '2025-01-01 01:02:03' AS ts",
             js=js,
         )
-        assert lines[2] == "true|170141183460469231731687303715884105727|12:00:00|1 day|1.25|5", lines
+        assert lines[2] == (
+            "true|false|-170141183460469231731687303715884105727|12:00:00|1 day|"
+            "-1.25|-12345.67|-123456789012.34|-123456789012345678901.23|5|\\x00\\xAB|"
+            "2025-01-01|2025-01-01 01:02:03"
+        ), lines
 
-    print(f"[{tag}] All 12 DuckDB checks passed!")
+        # 13. Single-rounding F32 accuracy (no double rounding via double)
+        lines = run_cli(
+            "f32bits",
+            ":memory:",
+            "SELECT (1152921710765277183::BIGINT)::FLOAT AS direct_f, "
+            "1152921710765277183::BIGINT AS raw_bigint",
+            js=js,
+        )
+        assert lines[0] == "F32BITS 1 2", lines
+        b0, b1 = [int(x) for x in lines[2].split()]
+        assert b0 == 0x5D800001 and b1 == 0x5D800001, (hex(b0), hex(b1))
+
+        # 14. Long column name (>260 chars) in type error is not truncated
+        long_col = "c" * 280
+        lines = run_cli("f32", ":memory:", f'SELECT \'x\' AS "{long_col}"', js=js)
+        assert lines[0].startswith("FAIL 22 ") and long_col in lines[0] and "use query_text" in lines[0], lines
+
+        # 15. SQL starting with `--` comment works on both C and JS lanes
+        lines = run_cli("f32", ":memory:", "-- leading comment\nSELECT 7 AS a", js=js)
+        assert lines[0] == "F32 1 1" and float(lines[2]) == 7.0, lines
+
+        # 16. DUCKDB_LIB override fails loudly instead of silently falling back
+        lines = run_cli(
+            "f32",
+            ":memory:",
+            "SELECT 1",
+            js=js,
+            env_extra={"DUCKDB_LIB": os.path.join(td, "does_not_exist.dylib")},
+        )
+        assert lines[0].startswith("FAIL 2 ") and "DUCKDB_LIB" in lines[0], lines
+
+        if platform.system() == "Darwin":
+            enosys = 78
+            bad_lib = "/usr/lib/libSystem.B.dylib"
+            lines = run_cli(
+                "f32",
+                ":memory:",
+                "SELECT 1",
+                js=js,
+                env_extra={"DUCKDB_LIB": bad_lib},
+            )
+            assert lines[0].startswith(f"FAIL {enosys} ") and "missing required C API symbols" in lines[0], lines
+
+        # 17. Embedded NUL bytes in VARCHAR (inlined <=12B, pointer >12B, leading NUL, multi-chunk >2048 rows)
+        if not js:
+            lines = run_cli(
+                "textlen",
+                ":memory:",
+                "SELECT 'abc' || chr(0) || 'def' AS mid, chr(0) || 'abc' AS lead, "
+                "repeat('x', 15) || chr(0) || 'yz' AS long_nul, '' AS emp, NULL::VARCHAR AS nul",
+                js=False,
+            )
+            assert lines[0] == "TEXTLEN 1 5", lines
+            assert lines[2] == "7 4 18 0 0", lines
+
+            # Multi-chunk (>2048 rows) mixed VARCHAR + INT with embedded NULs
+            lines = run_cli(
+                "textlen",
+                ":memory:",
+                "SELECT i, 'a' || chr(0) || 'b' AS s FROM range(2100) t(i)",
+                js=False,
+            )
+            assert lines[0] == "TEXTLEN 2100 2", lines[0]
+            assert lines[2] == "1 3" and lines[-1] == "4 3", (lines[2], lines[-1])
+
+    print(f"[{tag}] All {16 if js else 17} DuckDB checks passed!")
 
 
 if __name__ == "__main__":

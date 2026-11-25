@@ -1,6 +1,15 @@
 // DuckDB JS-lane effect for Bend (Bun FFI via bun:ffi).
 // Uses the same libduckdb C API and candidate library paths as duckdb.c.
-let _bddb = null;
+let _bddbLib = null;
+let _bddb    = null;
+
+function bddb_errno_enosys() {
+  return typeof process !== "undefined" && process.platform === "darwin" ? 78 : 38;
+}
+
+function bddb_errno_eoverflow() {
+  return typeof process !== "undefined" && process.platform === "darwin" ? 84 : 75;
+}
 
 function bddb_is_numeric_type(t) {
   return (t >= 2 && t <= 11) || t === 16 || t === 19 || t === 32 || t === 36;
@@ -18,26 +27,11 @@ function bddb_fail(code, text) {
 function bddb_load() {
   if (_bddb !== null) return _bddb;
   if (typeof Bun === "undefined") {
-    throw new Error("DuckDB JS effect requires Bun (or compile natively with `bend file.bend -o out`)");
+    const err = new Error("DuckDB JS effect requires Bun (or compile natively with `bend file.bend -o out`)");
+    err.bddbCode = bddb_errno_enosys();
+    throw err;
   }
   const { dlopen, FFIType } = require("bun:ffi");
-  const candidates = [
-    process.env.DUCKDB_LIB,
-    ...(process.platform === "darwin"
-      ? [
-          "libduckdb.dylib",
-          "/opt/homebrew/lib/libduckdb.dylib",
-          "/usr/local/lib/libduckdb.dylib",
-        ]
-      : [
-          "libduckdb.so",
-          "/usr/local/lib/libduckdb.so",
-          "/usr/lib/libduckdb.so",
-          "/usr/lib/x86_64-linux-gnu/libduckdb.so",
-          "/usr/lib/aarch64-linux-gnu/libduckdb.so",
-        ]),
-  ].filter(Boolean);
-
   const syms = {
     duckdb_open_ext:       { args: ["ptr", "ptr", "ptr", "ptr"], returns: FFIType.i32 },
     duckdb_close:          { args: ["ptr"], returns: FFIType.void },
@@ -54,18 +48,65 @@ function bddb_load() {
     duckdb_column_type:    { args: ["ptr", "u64"], returns: FFIType.i32 },
     duckdb_result_error:   { args: ["ptr"], returns: FFIType.cstring },
     duckdb_value_is_null:  { args: ["ptr", "u64", "u64"], returns: FFIType.bool },
-    duckdb_value_double:   { args: ["ptr", "u64", "u64"], returns: FFIType.f64 },
+    duckdb_value_float:    { args: ["ptr", "u64", "u64"], returns: FFIType.f32 },
     duckdb_value_varchar:  { args: ["ptr", "u64", "u64"], returns: FFIType.ptr },
     duckdb_free:           { args: ["ptr"], returns: FFIType.void },
   };
 
+  const envLib = process.env.DUCKDB_LIB;
+  if (envLib && envLib.length > 0) {
+    try {
+      const lib = dlopen(envLib, syms);
+      _bddbLib = lib;
+      _bddb = lib.symbols;
+      return _bddb;
+    } catch (e) {
+      const detail = String(e && e.message ? e.message : e);
+      const isSym = /symbol/i.test(detail);
+      const err = new Error(
+        isSym
+          ? `DuckDB: DUCKDB_LIB '${envLib}' is missing required C API symbols (${detail})`
+          : `DuckDB: could not load DUCKDB_LIB '${envLib}': ${detail}`
+      );
+      err.bddbCode = isSym ? bddb_errno_enosys() : 2;
+      throw err;
+    }
+  }
+
+  const candidates = process.platform === "darwin"
+    ? [
+        "libduckdb.dylib",
+        "/opt/homebrew/lib/libduckdb.dylib",
+        "/usr/local/lib/libduckdb.dylib",
+      ]
+    : [
+        "libduckdb.so",
+        "/usr/local/lib/libduckdb.so",
+        "/usr/lib/libduckdb.so",
+        "/usr/lib/x86_64-linux-gnu/libduckdb.so",
+        "/usr/lib/aarch64-linux-gnu/libduckdb.so",
+      ];
+
+  let sawMissingSyms = false;
   for (const path of candidates) {
     try {
-      _bddb = dlopen(path, syms).symbols;
+      const lib = dlopen(path, syms);
+      _bddbLib = lib;
+      _bddb = lib.symbols;
       return _bddb;
-    } catch (_) {}
+    } catch (e) {
+      if (/symbol/i.test(String(e && e.message ? e.message : e))) {
+        sawMissingSyms = true;
+      }
+    }
   }
-  throw new Error("DuckDB: could not load libduckdb (install duckdb or set DUCKDB_LIB)");
+  const err = new Error(
+    sawMissingSyms
+      ? "DuckDB: libduckdb is missing required C API symbols"
+      : "DuckDB: could not load libduckdb (install duckdb or set DUCKDB_LIB)"
+  );
+  err.bddbCode = sawMissingSyms ? bddb_errno_enosys() : 2;
+  throw err;
 }
 
 function bddb_cstr(s) {
@@ -88,7 +129,7 @@ function bddb_run(mode, db_path, sql) {
   try {
     api = bddb_load();
   } catch (e) {
-    return bddb_fail(2, String(e.message || e));
+    return bddb_fail(e && typeof e.bddbCode === "number" ? e.bddbCode : 2, String(e && e.message ? e.message : e));
   }
   const { ptr, CString } = require("bun:ffi");
   const cfgBuf  = new BigUint64Array(1);
@@ -96,7 +137,7 @@ function bddb_run(mode, db_path, sql) {
   const connBuf = new BigUint64Array(1);
   const errBuf  = new BigUint64Array(1);
   const resBuf  = new BigUint64Array(6); // sizeof(duckdb_result) = 48 bytes
-  let haveCfg = false, haveDb = false, haveConn = false, haveRes = false;
+  let haveRes = false;
 
   try {
     const isMem = db_path === "" || db_path === ":memory:";
@@ -104,7 +145,6 @@ function bddb_run(mode, db_path, sql) {
       if (api.duckdb_create_config(ptr(cfgBuf)) !== 0) {
         return bddb_fail(22, "DuckDB: create_config failed");
       }
-      haveCfg = true;
       const k = bddb_cstr("access_mode");
       const v = bddb_cstr("READ_ONLY");
       if (api.duckdb_set_config(Number(cfgBuf[0]), ptr(k), ptr(v)) !== 0) {
@@ -115,37 +155,40 @@ function bddb_run(mode, db_path, sql) {
     const rcOpen = api.duckdb_open_ext(
       pBuf ? ptr(pBuf) : 0,
       ptr(dbBuf),
-      haveCfg ? Number(cfgBuf[0]) : 0,
+      cfgBuf[0] !== 0n ? Number(cfgBuf[0]) : 0,
       ptr(errBuf)
     );
     if (rcOpen !== 0) {
       let msg = "DuckDB: open failed";
       if (errBuf[0] !== 0n) {
-        msg = String(new CString(Number(errBuf[0])));
+        msg = String(new CString(Number(errBuf[0]))) || msg;
         api.duckdb_free(Number(errBuf[0]));
       }
       return bddb_fail(5, msg);
     }
-    haveDb = true;
     if (api.duckdb_connect(Number(dbBuf[0]), ptr(connBuf)) !== 0) {
       return bddb_fail(5, "DuckDB: connect failed");
     }
-    haveConn = true;
     const sBuf = bddb_cstr(sql);
     const rcQ = api.duckdb_query(Number(connBuf[0]), ptr(sBuf), ptr(resBuf));
     haveRes = true;
     if (rcQ !== 0) {
-      const msg = String(api.duckdb_result_error(ptr(resBuf)) || "DuckDB: query failed");
+      const msg = String(api.duckdb_result_error(ptr(resBuf))) || "DuckDB: query failed";
       return bddb_fail(22, msg);
     }
     if (mode === "exec") {
       return io_done({ $: CID(Unit) });
     }
-    const nrows = Number(api.duckdb_row_count(ptr(resBuf)));
-    const ncols = Number(api.duckdb_column_count(ptr(resBuf)));
+    const nrBig = api.duckdb_row_count(ptr(resBuf));
+    const ncBig = api.duckdb_column_count(ptr(resBuf));
+    if (nrBig > 0xFFFFFFFFn || ncBig > 0xFFFFFFFFn) {
+      return bddb_fail(bddb_errno_eoverflow(), "DuckDB: result dimensions exceed U32");
+    }
+    const nrows = Number(nrBig);
+    const ncols = Number(ncBig);
     const names = [];
     for (let c = 0; c < ncols; c++) {
-      const nm = String(api.duckdb_column_name(ptr(resBuf), BigInt(c)) || "");
+      const nm = String(api.duckdb_column_name(ptr(resBuf), BigInt(c))) || "";
       const ct = api.duckdb_column_type(ptr(resBuf), BigInt(c));
       if (mode === "f32" && !bddb_is_numeric_type(ct)) {
         return bddb_fail(
@@ -167,7 +210,7 @@ function bddb_run(mode, db_path, sql) {
       for (let c = 0; c < ncols; c++) {
         const isNull = api.duckdb_value_is_null(ptr(resBuf), BigInt(c), BigInt(r));
         if (mode === "f32") {
-          row.push(isNull ? NaN : Math.fround(api.duckdb_value_double(ptr(resBuf), BigInt(c), BigInt(r))));
+          row.push(isNull ? NaN : api.duckdb_value_float(ptr(resBuf), BigInt(c), BigInt(r)));
         } else {
           if (isNull) {
             row.push("");
@@ -187,9 +230,9 @@ function bddb_run(mode, db_path, sql) {
     return io_done(io_tup(nrows, io_tup(ncols, io_tup(bddb_list(names), bddb_list(rows)))));
   } finally {
     if (haveRes) api.duckdb_destroy_result(ptr(resBuf));
-    if (haveConn) api.duckdb_disconnect(ptr(connBuf));
-    if (haveDb) api.duckdb_close(ptr(dbBuf));
-    if (haveCfg) api.duckdb_destroy_config(ptr(cfgBuf));
+    if (connBuf[0] !== 0n) api.duckdb_disconnect(ptr(connBuf));
+    if (dbBuf[0] !== 0n) api.duckdb_close(ptr(dbBuf));
+    if (cfgBuf[0] !== 0n) api.duckdb_destroy_config(ptr(cfgBuf));
   }
 }
 
