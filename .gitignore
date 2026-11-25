@@ -1,0 +1,7 @@
+out/
+**/out/
+*.o
+.DS_Store
+__pycache__/
+*.duckdb
+*.duckdb.wal
